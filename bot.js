@@ -37,7 +37,7 @@ const FIELD_REVENUE = "Виручка";
 const FIELD_ENTRANCE_REVENUE = "Виручка Вхід";
 
 const SHIFT_PAYTYPE_FIELD = "ЗП для бота";
-const PAYTYPE_ALLOWED = new Set(["%", "Ставка + %"]); // НЕ ТРОГАЮ
+const PAYTYPE_ALLOWED = new Set(["%", "Ставка + %"]);
 
 // acquiring field
 const FIELD_ACQ_VALUE = "Еквайринг Poster (API)";
@@ -279,6 +279,13 @@ async function posterGetPaymentsByDay({ account, token, startDate, endDate }) {
   }));
 }
 
+function normText(s) {
+  return String(s || "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
 async function posterGetEntranceRevenueForOneDay({ account, token, dateISO }) {
   const url = `https://${account}.joinposter.com/api/dash.getCategoriesSales`;
 
@@ -305,22 +312,44 @@ async function posterGetEntranceRevenueForOneDay({ account, token, dateISO }) {
     throw new Error(`Unexpected Poster categories format for ${account}`);
   }
 
-  let revenue = 0;
-  for (const r of rows) {
-    const id = String(r.category_id || "").trim();
-    const name = String(r.category_name || "").trim();
+  const targetId = String(ENTRANCE_CATEGORY_ID || "").trim();
+  const targetName = normText(ENTRANCE_CATEGORY_NAME);
 
-    const matchById =
-      ENTRANCE_CATEGORY_ID && id === String(ENTRANCE_CATEGORY_ID);
-    const matchByName =
-      ENTRANCE_CATEGORY_NAME && name === String(ENTRANCE_CATEGORY_NAME);
+  let revenue = 0;
+  let matched = 0;
+
+  for (const r of rows) {
+    const id = String(r.category_id ?? "").trim();
+    const name = normText(r.category_name);
+
+    const matchById = targetId && id === targetId;
+    const matchByName = targetName && name === targetName;
 
     if (matchById || matchByName) {
+      matched++;
+      // Важно: у Poster revenue обычно в копейках/центах -> /100
       revenue += normalizeMoneyToNumber(r.revenue || 0) / 100;
     }
   }
 
-  return revenue; // number
+  console.log(
+    `[ENTRANCE] ${account} ${dateISO} matched=${matched} revenue=${revenue}`
+  );
+
+  // Если не нашли — покажем подсказку (первые 10 категорий)
+  if (!matched) {
+    const sample = rows.slice(0, 10).map((x) => ({
+      id: x.category_id,
+      name: x.category_name,
+      revenue: x.revenue,
+    }));
+    console.log(
+      `[ENTRANCE] NO MATCH. targetId=${targetId} targetName="${ENTRANCE_CATEGORY_NAME}". sample:`,
+      sample
+    );
+  }
+
+  return revenue; // number (может быть 0)
 }
 
 // ================== FETCH POSTER DATA (demo/real) ==================
@@ -436,9 +465,7 @@ async function savePosterToAirtable(posterData) {
 
 // ================== APPLY REVENUE TO SHIFTS (UPDATE ONLY) ==================
 async function applyRevenuesToShifts(accruals, startDate, endDate) {
-  if (!accruals || !accruals.length) {
-    return { updated: 0 };
-  }
+  if (!accruals || !accruals.length) return { updated: 0 };
 
   const totalByKey = new Map();
   const entranceByKey = new Map();
@@ -447,8 +474,11 @@ async function applyRevenuesToShifts(accruals, startDate, endDate) {
     const d = toISODateOnly(a.date);
     if (!d) continue;
     const k = `${d}::${a.outlet}`;
+
     totalByKey.set(k, normalizeMoneyToNumber(a.totalRevenue || 0));
-    if (a.outlet === ENTRANCE_OUTLET_NAME) {
+
+    // важно: кладем даже 0, чтобы потом записать 0 в Airtable
+    if (a.outlet === ENTRANCE_OUTLET_NAME && a.entranceRevenue !== undefined) {
       entranceByKey.set(k, normalizeMoneyToNumber(a.entranceRevenue || 0));
     }
   }
@@ -484,6 +514,7 @@ async function applyRevenuesToShifts(accruals, startDate, endDate) {
   }
 
   const updates = [];
+  let entranceWrites = 0;
 
   for (const r of shiftRecs) {
     const date = toISODateOnly(r.fields?.[FIELD_DATE]);
@@ -499,30 +530,35 @@ async function applyRevenuesToShifts(accruals, startDate, endDate) {
 
     const key = `${date}::${outletName}`;
     const totalRevenue = totalByKey.get(key);
-
     if (typeof totalRevenue !== "number") continue;
 
     const fieldsToUpdate = {
       [FIELD_REVENUE]: totalRevenue,
     };
 
-    // entrance only for Джерельна
-    if (outletName === ENTRANCE_OUTLET_NAME) {
-      const ent = entranceByKey.get(key);
-      if (typeof ent === "number") {
+    // сравнение по нормализованному названию, чтобы не убивалось пробелами/регистром
+    if (normText(outletName) === normText(ENTRANCE_OUTLET_NAME)) {
+      if (entranceByKey.has(key)) {
+        const ent = entranceByKey.get(key); // может быть 0
         fieldsToUpdate[FIELD_ENTRANCE_REVENUE] = ent;
+        entranceWrites++;
+      } else {
+        // если вдруг нет ключа — запишем 0, чтобы было видно, что логика сработала
+        fieldsToUpdate[FIELD_ENTRANCE_REVENUE] = 0;
+        entranceWrites++;
       }
     }
 
-    updates.push({
-      id: r.id,
-      fields: fieldsToUpdate,
-    });
+    updates.push({ id: r.id, fields: fieldsToUpdate });
   }
 
   if (updates.length) {
     await updateInBatches(TABLE_SHIFTS, updates, 10);
   }
+
+  console.log(
+    `[ENTRANCE] Airtable writes to "${FIELD_ENTRANCE_REVENUE}": ${entranceWrites}`
+  );
 
   return { updated: updates.length };
 }
