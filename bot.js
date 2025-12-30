@@ -1,0 +1,682 @@
+require("dotenv").config();
+const { Telegraf, Markup } = require("telegraf");
+const Airtable = require("airtable");
+const axios = require("axios");
+
+const bot = new Telegraf(process.env.BOT_TOKEN);
+
+const ADMIN_IDS = process.env.ADMIN_IDS
+  ? process.env.ADMIN_IDS.split(",").map((id) => id.trim())
+  : [];
+
+const base = new Airtable({ apiKey: process.env.AIRTABLE_API_KEY }).base(
+  process.env.AIRTABLE_BASE_ID
+);
+
+// ================== CONFIG ==================
+const TABLE_SHIFTS = "Нарахування";
+const TABLE_ACQUIRING = "Еквайринг";
+
+const TABLE_OUTLETS = "Заклади";
+const TABLE_POSITIONS = "Посади";
+const TABLE_EMPLOYEES = "Працівники";
+
+const OUTLETS_NAME_FIELD = "Назва закладу";
+const POSITIONS_NAME_FIELD = "Скорочена назва";
+const EMP_TG_FIELD = "Telegram ID";
+
+const FIELD_DATE = "Дата";
+const FIELD_OUTLET = "Заклад";
+const FIELD_POSITION = "Посада";
+const FIELD_EMPLOYEE = "Працівник";
+const FIELD_REVENUE = "Виручка";
+
+const EMP_PAYTYPE_FIELD = "ЗП для бота";
+const PAYTYPE_ALLOWED = new Set(["%", "Ставка + %"]);
+
+const FIELD_ACQ_VALUE = "Еквайринг Poster (API)";
+
+const POSTER_TOKENS = {
+  Староєврейська: process.env.POSTER_SE,
+  Дорошенка: process.env.POSTER_DO,
+  Джерельна: process.env.POSTER_DZH,
+};
+
+const POSTER_ACCOUNTS = {
+  Староєврейська: "grebu4e",
+  Дорошенка: "grebuche-iabko-kriva-lipa",
+  Джерельна: "rayon-gy",
+};
+
+const OUTLETS = ["Староєврейська", "Дорошенка", "Джерельна"];
+const POSITIONS = [
+  "СТ Бармен",
+  "ПСТ Бармен",
+  "МЛ Бармен",
+  "СТ Охоронець",
+  "МЛ Охоронець",
+  "СТ МС",
+  "ПСТ МС",
+  "МЛ МС",
+  "СТ DJ",
+  "МЛ DJ",
+  "PJ",
+];
+
+const isAdmin = (ctx) => ADMIN_IDS.includes(String(ctx.from.id));
+const userState = new Map();
+
+// ================== HELPERS ==================
+function parseISODate(s) {
+  const d = new Date(`${s}T00:00:00Z`);
+  if (Number.isNaN(d.getTime())) throw new Error(`Bad date: ${s}`);
+  return d;
+}
+
+function assertISODate(s) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(s))) throw new Error("bad date");
+  parseISODate(s);
+}
+
+function formatISODate(d) {
+  const yyyy = d.getUTCFullYear();
+  const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(d.getUTCDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+function datesBetween(startISO, endISO) {
+  const start = parseISODate(startISO);
+  const end = parseISODate(endISO);
+  if (end < start) throw new Error("endDate is earlier than startDate");
+
+  const out = [];
+  for (let d = new Date(start); d <= end; d.setUTCDate(d.getUTCDate() + 1)) {
+    out.push(formatISODate(d));
+  }
+  return out;
+}
+
+function seededRand(seed) {
+  let x = seed >>> 0;
+  return () => {
+    x ^= x << 13;
+    x ^= x >>> 17;
+    x ^= x << 5;
+    return (x >>> 0) / 4294967296;
+  };
+}
+
+function hashStrToSeed(str) {
+  let h = 2166136261;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+
+function round2(n) {
+  return Math.round(n * 100) / 100;
+}
+
+async function createInBatches(tableName, records, batchSize = 10) {
+  for (let i = 0; i < records.length; i += batchSize) {
+    const batch = records.slice(i, i + batchSize);
+    await base(tableName).create(batch);
+  }
+}
+
+async function updateInBatches(tableName, records, batchSize = 10) {
+  for (let i = 0; i < records.length; i += batchSize) {
+    const batch = records.slice(i, i + batchSize);
+    await base(tableName).update(batch);
+  }
+}
+
+function toISODateOnly(val) {
+  if (!val) return null;
+  if (val instanceof Date) return val.toISOString().slice(0, 10);
+
+  const s = String(val);
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+  if (/^\d{4}-\d{2}-\d{2}T/.test(s)) return s.slice(0, 10);
+
+  const d = new Date(s);
+  if (!Number.isNaN(d.getTime())) return d.toISOString().slice(0, 10);
+  return null;
+}
+
+// ================== LINK RESOLVERS ==================
+const linkIdCache = new Map();
+
+async function getLinkedRecordIdByName(tableName, nameField, name) {
+  const key = `${tableName}:${nameField}:${name}`;
+  if (linkIdCache.has(key)) return linkIdCache.get(key);
+
+  const escaped = String(name).replace(/"/g, '\\"');
+  const formula = `{${nameField}} = "${escaped}"`;
+
+  const records = await base(tableName)
+    .select({ filterByFormula: formula, maxRecords: 1 })
+    .firstPage();
+
+  if (!records || records.length === 0) {
+    throw new Error(
+      `Не знайдено "${name}" у таблиці "${tableName}" по полю "${nameField}".`
+    );
+  }
+
+  const id = records[0].id;
+  linkIdCache.set(key, id);
+  return id;
+}
+
+async function linkOutlet(outletName) {
+  const id = await getLinkedRecordIdByName(
+    TABLE_OUTLETS,
+    OUTLETS_NAME_FIELD,
+    outletName
+  );
+  return [id];
+}
+
+async function linkPosition(positionName) {
+  const id = await getLinkedRecordIdByName(
+    TABLE_POSITIONS,
+    POSITIONS_NAME_FIELD,
+    positionName
+  );
+  return [id];
+}
+
+const employeeCache = new Map();
+async function getEmployeeRecIdByTgId(tgId) {
+  const key = String(tgId);
+  if (employeeCache.has(key)) return employeeCache.get(key);
+
+  const escaped = key.replace(/"/g, '\\"');
+  const formula = `{${EMP_TG_FIELD}} = "${escaped}"`;
+
+  const records = await base(TABLE_EMPLOYEES)
+    .select({ filterByFormula: formula, maxRecords: 1 })
+    .firstPage();
+
+  if (!records || records.length === 0) {
+    throw new Error(
+      `Твого профілю немає в "${TABLE_EMPLOYEES}". Попроси адміна додати тебе (поле "${EMP_TG_FIELD}" = ${key}).`
+    );
+  }
+
+  const id = records[0].id;
+  employeeCache.set(key, id);
+  return id;
+}
+
+async function linkEmployeeByTgId(tgId) {
+  const id = await getEmployeeRecIdByTgId(tgId);
+  return [id];
+}
+
+// ================== POSTER API ==================
+async function posterGetPaymentsByDay({ account, token, startDate, endDate }) {
+  const url = `https://${account}.joinposter.com/api/dash.getPaymentsReport`;
+
+  const { data } = await axios.get(url, {
+    params: { token, date_from: startDate, date_to: endDate },
+    timeout: 20000,
+  });
+
+  if (typeof data === "string") {
+    throw new Error(`Poster returned non-JSON string for ${account}`);
+  }
+  if (data?.error) {
+    throw new Error(
+      `Poster error for ${account}: ${data.error.message || "Unknown error"}`
+    );
+  }
+
+  const days = data?.response?.days;
+  if (!Array.isArray(days)) {
+    throw new Error(`Unexpected Poster API format for ${account}`);
+  }
+
+  return days.map((day) => ({
+    date: day.date || null,
+    cardRevenue: Number(day.payed_card_sum || 0) / 100,
+    totalRevenue:
+      Number(day.payed_sum_sum ?? day.total_sum ?? day.sum ?? 0) / 100,
+  }));
+}
+
+// ================== FETCH POSTER DATA (demo/real) ==================
+async function fetchPosterData(startDate, endDate) {
+  const mode = (process.env.POSTER_MODE || "demo").toLowerCase();
+
+  if (mode === "demo") {
+    const days = datesBetween(startDate, endDate);
+    const acquiring = [];
+    const accruals = [];
+
+    for (const day of days) {
+      for (const outlet of OUTLETS) {
+        const rand = seededRand(hashStrToSeed(`${day}|${outlet}`));
+        const totalRevenue = round2(1200 + rand() * 4800);
+        const cardRevenue = round2(totalRevenue * (0.25 + rand() * 0.45));
+
+        acquiring.push({ date: day, outlet, cardRevenue });
+        accruals.push({ date: day, outlet, totalRevenue });
+      }
+    }
+
+    return { acquiring, accruals };
+  }
+
+  const acquiring = [];
+  const accruals = [];
+
+  for (const outlet of OUTLETS) {
+    const token = POSTER_TOKENS[outlet];
+    const account = POSTER_ACCOUNTS[outlet];
+
+    if (!token) throw new Error(`Нема Poster токена для закладу: ${outlet}`);
+    if (!account) throw new Error(`Нема Poster account для закладу: ${outlet}`);
+
+    const daysData = await posterGetPaymentsByDay({
+      account,
+      token,
+      startDate,
+      endDate,
+    });
+
+    for (const d of daysData) {
+      if (!d.date) continue;
+
+      acquiring.push({ date: d.date, outlet, cardRevenue: d.cardRevenue });
+      accruals.push({ date: d.date, outlet, totalRevenue: d.totalRevenue });
+    }
+  }
+
+  return { acquiring, accruals };
+}
+
+// ================== SAVE ACQUIRING (ALWAYS CREATE) ==================
+async function savePosterToAirtable(posterData) {
+  const acquiringRecords = [];
+
+  for (const item of posterData.acquiring) {
+    const outletLink = await linkOutlet(item.outlet);
+    acquiringRecords.push({
+      fields: {
+        [FIELD_DATE]: item.date,
+        [FIELD_OUTLET]: outletLink,
+        [FIELD_ACQ_VALUE]: item.cardRevenue,
+      },
+    });
+  }
+
+  if (acquiringRecords.length) {
+    await createInBatches(TABLE_ACQUIRING, acquiringRecords, 10);
+  }
+
+  return { created: acquiringRecords.length };
+}
+
+// ================== APPLY TOTAL REVENUE TO SHIFTS (UPDATE ONLY) ==================
+async function applyTotalRevenueToShifts(accruals, startDate, endDate) {
+  if (!accruals || !accruals.length) {
+    console.log("ACCRUALS: empty");
+    return { updated: 0 };
+  }
+
+  const revenueByKey = new Map();
+  for (const a of accruals) {
+    const d = toISODateOnly(a.date);
+    if (!d) continue;
+    revenueByKey.set(`${d}::${a.outlet}`, Number(a.totalRevenue || 0));
+  }
+  console.log("ACCRUALS keys:", revenueByKey.size);
+
+  const formula =
+    `AND(` +
+    `{${FIELD_DATE}} >= DATETIME_PARSE("${startDate}"),` +
+    `{${FIELD_DATE}} <= DATETIME_PARSE("${endDate}")` +
+    `)`;
+
+  const shiftRecs = await base(TABLE_SHIFTS)
+    .select({
+      filterByFormula: formula,
+      fields: [FIELD_DATE, FIELD_OUTLET, FIELD_EMPLOYEE, EMP_PAYTYPE_FIELD],
+    })
+    .all();
+
+  console.log("SHIFT FOUND:", shiftRecs.length);
+  if (!shiftRecs.length) return { updated: 0 };
+
+  const outletIds = new Set();
+  for (const r of shiftRecs) {
+    const outletLinks = r.fields?.[FIELD_OUTLET];
+    if (Array.isArray(outletLinks) && outletLinks[0])
+      outletIds.add(outletLinks[0]);
+  }
+
+  const outletNameById = new Map();
+  for (const outletId of outletIds) {
+    const outletRec = await base(TABLE_OUTLETS).find(outletId);
+    const name = String(outletRec?.fields?.[OUTLETS_NAME_FIELD] || "").trim();
+    outletNameById.set(outletId, name);
+  }
+
+  const payTypeStats = {};
+  let skippedPaytype = 0;
+  let skippedNoRevenue = 0;
+  let skippedNoOutlet = 0;
+
+  const updates = [];
+
+  for (const r of shiftRecs) {
+    const date = toISODateOnly(r.fields?.[FIELD_DATE]);
+    const outletLinks = r.fields?.[FIELD_OUTLET];
+
+    if (!date) continue;
+    if (!Array.isArray(outletLinks) || !outletLinks[0]) {
+      skippedNoOutlet++;
+      continue;
+    }
+
+    const outletName = outletNameById.get(outletLinks[0]);
+    if (!outletName) {
+      skippedNoOutlet++;
+      continue;
+    }
+
+    const payType = String(r.fields?.[EMP_PAYTYPE_FIELD] || "").trim();
+    const k = payType || "(empty)";
+    payTypeStats[k] = (payTypeStats[k] || 0) + 1;
+
+    if (!PAYTYPE_ALLOWED.has(payType)) {
+      skippedPaytype++;
+      continue;
+    }
+
+    const totalRevenue = revenueByKey.get(`${date}::${outletName}`);
+    if (typeof totalRevenue !== "number") {
+      skippedNoRevenue++;
+      continue;
+    }
+
+    updates.push({
+      id: r.id,
+      fields: { [FIELD_REVENUE]: totalRevenue },
+    });
+  }
+
+  console.log("PAYTYPE STATS:", payTypeStats);
+  console.log("UPDATES:", updates.length);
+  console.log("SKIP paytype:", skippedPaytype);
+  console.log("SKIP no revenue match:", skippedNoRevenue);
+  console.log("SKIP no outlet:", skippedNoOutlet);
+
+  if (updates.length) {
+    await updateInBatches(TABLE_SHIFTS, updates, 10);
+  }
+
+  return { updated: updates.length };
+}
+
+// ================== UI ==================
+function mainMenu(ctx) {
+  const buttons = [];
+  buttons.push([Markup.button.callback("Заповнити зміну", "EMP_FILL_SHIFT")]);
+
+  if (isAdmin(ctx)) {
+    buttons.push([
+      Markup.button.callback("Передати інформацію з POSTER", "ADM_POSTER"),
+    ]);
+  }
+
+  return ctx.reply("Головне меню:", Markup.inlineKeyboard(buttons));
+}
+
+bot.start((ctx) => mainMenu(ctx));
+
+// ================== EMPLOYEE FLOW ==================
+bot.action("EMP_FILL_SHIFT", async (ctx) => {
+  await ctx.answerCbQuery();
+  userState.set(ctx.from.id, { role: "employee", step: "DATE" });
+  return ctx.reply(
+    "Введіть дату зміни в форматі РРРР-ММ-ДД (наприклад, 2025-12-08)."
+  );
+});
+
+bot.on("text", async (ctx) => {
+  const state = userState.get(ctx.from.id);
+  if (!state) return;
+  if (state.role === "employee") return handleEmployeeFlow(ctx, state);
+  if (state.role === "admin") return handleAdminFlow(ctx, state);
+});
+
+async function handleEmployeeFlow(ctx, state) {
+  const text = ctx.message.text.trim();
+
+  if (state.step === "DATE") {
+    try {
+      assertISODate(text);
+    } catch {
+      return ctx.reply("Невірний формат. Введіть дату як РРРР-ММ-ДД.");
+    }
+
+    state.date = text;
+    state.step = "OUTLET";
+
+    return ctx.reply(
+      "Виберіть заклад:",
+      Markup.inlineKeyboard(
+        OUTLETS.map((o) => [Markup.button.callback(o, `EMP_OUTLET_${o}`)])
+      )
+    );
+  }
+}
+
+bot.action(/EMP_OUTLET_(.+)/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const outlet = ctx.match[1];
+
+  const state = userState.get(ctx.from.id);
+  if (!state || state.role !== "employee") return;
+
+  state.outlet = outlet;
+  state.step = "POSITION";
+
+  return ctx.reply(
+    "Виберіть посаду:",
+    Markup.inlineKeyboard(
+      POSITIONS.map((p) => [Markup.button.callback(p, `EMP_POS_${p}`)])
+    )
+  );
+});
+
+bot.action(/EMP_POS_(.+)/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const position = ctx.match[1];
+
+  const state = userState.get(ctx.from.id);
+  if (!state || state.role !== "employee") return;
+
+  state.position = position;
+
+  try {
+    const outletLink = await linkOutlet(state.outlet);
+    const positionLink = await linkPosition(state.position);
+    const employeeLink = await linkEmployeeByTgId(ctx.from.id);
+
+    const fields = {
+      [FIELD_DATE]: state.date,
+      [FIELD_OUTLET]: outletLink,
+      [FIELD_POSITION]: positionLink,
+      [FIELD_EMPLOYEE]: employeeLink,
+    };
+
+    const record = await base(TABLE_SHIFTS).create(fields);
+    userState.delete(ctx.from.id);
+
+    return ctx.reply(
+      `Зміна збережена:\nДата: ${state.date}\nЗаклад: ${state.outlet}\nПосада: ${state.position}`,
+      Markup.inlineKeyboard([
+        [Markup.button.callback("Видалити", `EMP_DEL_${record.id}`)],
+        [Markup.button.callback("Створити нову", "EMP_FILL_SHIFT")],
+      ])
+    );
+  } catch (e) {
+    console.error(e);
+    return ctx.reply(
+      "Помилка при збереженні. Перевір linked поля та Telegram ID у Працівники."
+    );
+  }
+});
+
+bot.action(/EMP_DEL_(.+)/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const recId = ctx.match[1];
+  try {
+    await base(TABLE_SHIFTS).destroy(recId);
+    return ctx.reply("Запис видалений.");
+  } catch (e) {
+    console.error(e);
+    return ctx.reply("Не вдалося видалити запис.");
+  }
+});
+
+// ================== ADMIN FLOW ==================
+bot.action("ADM_POSTER", async (ctx) => {
+  await ctx.answerCbQuery();
+  if (!isAdmin(ctx)) return ctx.reply("Ви не адміністратор.");
+  userState.set(ctx.from.id, { role: "admin", step: "START_DATE_INPUT" });
+  return ctx.reply("Введіть початкову дату періода (РРРР-ММ-ДД).");
+});
+
+async function handleAdminFlow(ctx, state) {
+  const text = ctx.message.text.trim();
+
+  if (state.step === "START_DATE_INPUT") {
+    try {
+      assertISODate(text);
+    } catch {
+      return ctx.reply("Невірний формат. Введіть дату як РРРР-ММ-ДД.");
+    }
+
+    state.startDate = text;
+    state.step = "START_DATE_CONFIRM";
+    return ctx.reply(
+      `Початкова дата: ${state.startDate}`,
+      Markup.inlineKeyboard([
+        [Markup.button.callback("✅ Підтвердити", "ADM_START_OK")],
+        [Markup.button.callback("✏️ Змінити", "ADM_START_EDIT")],
+        [Markup.button.callback("❌ Скасувати", "ADM_CANCEL")],
+      ])
+    );
+  }
+
+  if (state.step === "END_DATE_INPUT") {
+    try {
+      assertISODate(text);
+      if (parseISODate(text) < parseISODate(state.startDate)) {
+        return ctx.reply("Кінцева дата не може бути раніше початкової.");
+      }
+    } catch {
+      return ctx.reply("Невірний формат. Введіть дату як РРРР-ММ-ДД.");
+    }
+
+    state.endDate = text;
+    state.step = "END_DATE_CONFIRM";
+    return ctx.reply(
+      `Кінцева дата: ${state.endDate}`,
+      Markup.inlineKeyboard([
+        [Markup.button.callback("✅ Підтвердити", "ADM_END_OK")],
+        [Markup.button.callback("✏️ Змінити", "ADM_END_EDIT")],
+        [Markup.button.callback("❌ Скасувати", "ADM_CANCEL")],
+      ])
+    );
+  }
+}
+
+bot.action("ADM_START_EDIT", async (ctx) => {
+  await ctx.answerCbQuery();
+  const state = userState.get(ctx.from.id);
+  if (!state || state.role !== "admin") return;
+  state.step = "START_DATE_INPUT";
+  return ctx.reply("Введіть нову початкову дату (РРРР-ММ-ДД).");
+});
+
+bot.action("ADM_START_OK", async (ctx) => {
+  await ctx.answerCbQuery();
+  const state = userState.get(ctx.from.id);
+  if (!state || state.role !== "admin") return;
+  state.step = "END_DATE_INPUT";
+  return ctx.reply("Введіть кінцеву дату періода (РРРР-ММ-ДД).");
+});
+
+bot.action("ADM_END_EDIT", async (ctx) => {
+  await ctx.answerCbQuery();
+  const state = userState.get(ctx.from.id);
+  if (!state || state.role !== "admin") return;
+  state.step = "END_DATE_INPUT";
+  return ctx.reply("Введіть нову кінцеву дату (РРРР-ММ-ДД).");
+});
+
+bot.action("ADM_END_OK", async (ctx) => {
+  await ctx.answerCbQuery();
+  const state = userState.get(ctx.from.id);
+  if (!state || state.role !== "admin") return;
+
+  return ctx.reply(
+    `Період:\n${state.startDate} — ${state.endDate}\n\nПередати інформацію з Poster?`,
+    Markup.inlineKeyboard([
+      [Markup.button.callback("🚀 Передати інформацію", "ADM_SEND_POSTER")],
+      [Markup.button.callback("❌ Скасувати", "ADM_CANCEL")],
+    ])
+  );
+});
+
+bot.action("ADM_CANCEL", async (ctx) => {
+  await ctx.answerCbQuery();
+  userState.delete(ctx.from.id);
+  return ctx.reply("Операція відмінена.");
+});
+
+bot.action("ADM_SEND_POSTER", async (ctx) => {
+  await ctx.answerCbQuery();
+  const state = userState.get(ctx.from.id);
+  if (!state || state.role !== "admin") return;
+
+  try {
+    await ctx.reply("Отримую дані та відправляю в Airtable...");
+
+    const posterData = await fetchPosterData(state.startDate, state.endDate);
+
+    const acqRes = await savePosterToAirtable(posterData);
+    const res = await applyTotalRevenueToShifts(
+      posterData.accruals,
+      state.startDate,
+      state.endDate
+    );
+
+    await ctx.reply(
+      `Еквайринг: створено ${acqRes.created}\n` +
+        `Виручка в змінах (Нарахування): оновлено ${res?.updated || 0}`
+    );
+
+    userState.delete(ctx.from.id);
+    return ctx.reply("Дані успішно передані в Airtable.");
+  } catch (e) {
+    console.error(e);
+    return ctx.reply(`Помилка імпорту: ${e.message || "unknown error"}`);
+  }
+});
+
+// ================== START ==================
+bot.launch();
+console.log("Bot is running...");
+
+process.once("SIGINT", () => bot.stop("SIGINT"));
+process.once("SIGTERM", () => bot.stop("SIGTERM"));
