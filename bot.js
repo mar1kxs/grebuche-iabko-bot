@@ -36,9 +36,12 @@ const FIELD_EMPLOYEE = "Працівник";
 const FIELD_REVENUE = "Виручка";
 const FIELD_ENTRANCE_REVENUE = "Виручка Вхід";
 
-// IMPORTANT: paytype field is in SHIFTS (Нарахування) and is formula
+// paytype on SHIFT (formula / lookup already solved by you)
 const SHIFT_PAYTYPE_FIELD = "ЗП для бота";
-const PAYTYPE_ALLOWED = new Set(["%", "Ставка + %"]);
+
+// ✅ правила
+const PAYTYPE_FOR_TOTAL = new Set(["%", "Ставка + %"]);
+const PAYTYPE_FOR_ENTRANCE = "Ставка + % вхід";
 
 // acquiring field
 const FIELD_ACQ_VALUE = "Еквайринг Poster (API)";
@@ -60,7 +63,7 @@ const POSTER_ACCOUNTS = {
 // Entrance category (ONLY for Джерельна)
 const ENTRANCE_OUTLET_NAME = "Джерельна";
 const ENTRANCE_CATEGORY_NAME = "БРАСЛЕТИ - ВХОДИ";
-const ENTRANCE_CATEGORY_ID = "18";
+const ENTRANCE_CATEGORY_ID = "18"; // можно оставить, мы матчим id ИЛИ имя
 
 // ================== LISTS ==================
 const OUTLETS = ["Староєврейська", "Дорошенка", "Джерельна"];
@@ -254,16 +257,6 @@ async function linkEmployeeByTgId(tgId) {
   return [id];
 }
 
-// ================== OUTLET ID CACHE (IMPORTANT FOR ENTRANCE) ==================
-let ENTRANCE_OUTLET_ID = null;
-
-async function getEntranceOutletId() {
-  if (ENTRANCE_OUTLET_ID) return ENTRANCE_OUTLET_ID;
-  const link = await linkOutlet(ENTRANCE_OUTLET_NAME); // ["recxxxx"]
-  ENTRANCE_OUTLET_ID = link[0];
-  return ENTRANCE_OUTLET_ID;
-}
-
 // ================== POSTER API ==================
 async function posterGetPaymentsByDay({ account, token, startDate, endDate }) {
   const url = `https://${account}.joinposter.com/api/dash.getPaymentsReport`;
@@ -297,6 +290,7 @@ async function posterGetPaymentsByDay({ account, token, startDate, endDate }) {
   }));
 }
 
+// entrance: dash.getCategoriesSales for ONE day
 async function posterGetEntranceRevenueForOneDay({ account, token, dateISO }) {
   const url = `https://${account}.joinposter.com/api/dash.getCategoriesSales`;
 
@@ -358,12 +352,19 @@ async function posterGetEntranceRevenueForOneDay({ account, token, dateISO }) {
     );
   }
 
-  return revenue;
+  return revenue; // number
 }
 
 // ================== FETCH POSTER DATA (demo/real) ==================
 async function fetchPosterData(startDate, endDate) {
   const mode = (process.env.POSTER_MODE || "demo").toLowerCase();
+
+  // ✅ outletName -> outletRecordId (в Airtable)
+  const outletIdByName = {};
+  for (const outlet of OUTLETS) {
+    const [id] = await linkOutlet(outlet);
+    outletIdByName[outlet] = id;
+  }
 
   // DEMO
   if (mode === "demo") {
@@ -377,12 +378,19 @@ async function fetchPosterData(startDate, endDate) {
         const totalRevenue = round2(1200 + rand() * 4800);
         const cardRevenue = round2(totalRevenue * (0.25 + rand() * 0.45));
 
-        const outletLink = await linkOutlet(outlet);
-        const outletId = outletLink[0];
+        acquiring.push({
+          date: day,
+          outlet,
+          outletId: outletIdByName[outlet],
+          cardRevenue,
+        });
 
-        acquiring.push({ date: day, outlet, cardRevenue });
-
-        const a = { date: day, outlet, outletId, totalRevenue };
+        const a = {
+          date: day,
+          outlet,
+          outletId: outletIdByName[outlet],
+          totalRevenue,
+        };
 
         if (outlet === ENTRANCE_OUTLET_NAME) {
           a.entranceRevenue = round2(totalRevenue * 0.08);
@@ -398,7 +406,6 @@ async function fetchPosterData(startDate, endDate) {
   // REAL
   const acquiring = [];
   const accruals = [];
-
   const daysList = datesBetween(startDate, endDate);
 
   for (const outlet of OUTLETS) {
@@ -407,9 +414,6 @@ async function fetchPosterData(startDate, endDate) {
 
     if (!token) throw new Error(`Нема Poster токена для закладу: ${outlet}`);
     if (!account) throw new Error(`Нема Poster account для закладу: ${outlet}`);
-
-    const outletLink = await linkOutlet(outlet);
-    const outletId = outletLink[0];
 
     const daysData = await posterGetPaymentsByDay({
       account,
@@ -421,16 +425,18 @@ async function fetchPosterData(startDate, endDate) {
     const paymentsByDate = new Map();
     for (const d of daysData) {
       if (!d.date) continue;
-
       paymentsByDate.set(d.date, d);
 
+      // acquiring: всегда создаём
       acquiring.push({
         date: d.date,
         outlet,
+        outletId: outletIdByName[outlet],
         cardRevenue: d.cardRevenue,
       });
     }
 
+    // accruals: total + (entrance only for Джерельна)
     for (const dayISO of daysList) {
       const p = paymentsByDate.get(dayISO);
       if (!p) continue;
@@ -438,7 +444,7 @@ async function fetchPosterData(startDate, endDate) {
       const a = {
         date: dayISO,
         outlet,
-        outletId, // IMPORTANT
+        outletId: outletIdByName[outlet],
         totalRevenue: p.totalRevenue,
       };
 
@@ -448,7 +454,7 @@ async function fetchPosterData(startDate, endDate) {
           token,
           dateISO: dayISO,
         });
-        a.entranceRevenue = entrance;
+        a.entranceRevenue = entrance; // number
       }
 
       accruals.push(a);
@@ -463,7 +469,10 @@ async function savePosterToAirtable(posterData) {
   const acquiringRecords = [];
 
   for (const item of posterData.acquiring) {
-    const outletLink = await linkOutlet(item.outlet);
+    // item.outletId уже есть, но linked поле ждёт массив [id]
+    const outletLink = item.outletId
+      ? [item.outletId]
+      : await linkOutlet(item.outlet);
 
     acquiringRecords.push({
       fields: {
@@ -481,14 +490,23 @@ async function savePosterToAirtable(posterData) {
   return { created: acquiringRecords.length };
 }
 
-// ================== APPLY REVENUE TO SHIFTS (UPDATE ONLY) ==================
+// ================== APPLY REVENUES TO SHIFTS (UPDATE ONLY) ==================
+let entranceOutletIdCache = null;
+async function getEntranceOutletId() {
+  if (entranceOutletIdCache) return entranceOutletIdCache;
+  const [id] = await linkOutlet(ENTRANCE_OUTLET_NAME);
+  entranceOutletIdCache = id;
+  return id;
+}
+
 async function applyRevenuesToShifts(accruals, startDate, endDate) {
   if (!accruals || !accruals.length) return { updated: 0 };
 
   const entranceOutletId = await getEntranceOutletId();
 
-  const totalByKey = new Map(); // key = date::outletId
-  const entranceByKey = new Map(); // key = date::outletId
+  // key = YYYY-MM-DD::outletId
+  const totalByKey = new Map();
+  const entranceByKey = new Map();
 
   for (const a of accruals) {
     const d = toISODateOnly(a.date);
@@ -498,10 +516,10 @@ async function applyRevenuesToShifts(accruals, startDate, endDate) {
     if (!outletId) continue;
 
     const k = `${d}::${outletId}`;
-
     totalByKey.set(k, normalizeMoneyToNumber(a.totalRevenue || 0));
 
     if (outletId === entranceOutletId) {
+      // кладём даже 0
       entranceByKey.set(k, normalizeMoneyToNumber(a.entranceRevenue || 0));
     }
   }
@@ -522,43 +540,60 @@ async function applyRevenuesToShifts(accruals, startDate, endDate) {
   if (!shiftRecs.length) return { updated: 0 };
 
   const updates = [];
+  let totalWrites = 0;
   let entranceWrites = 0;
 
   for (const r of shiftRecs) {
     const date = toISODateOnly(r.fields?.[FIELD_DATE]);
     const outletLinks = r.fields?.[FIELD_OUTLET];
-
     if (!date) continue;
     if (!Array.isArray(outletLinks) || !outletLinks[0]) continue;
 
     const outletId = outletLinks[0];
-
     const payType = pickTextValue(r.fields?.[SHIFT_PAYTYPE_FIELD]);
-    if (!PAYTYPE_ALLOWED.has(payType)) continue;
 
     const key = `${date}::${outletId}`;
-    const totalRevenue = totalByKey.get(key);
-    if (typeof totalRevenue !== "number") continue;
 
-    const fieldsToUpdate = {
-      [FIELD_REVENUE]: totalRevenue,
-    };
+    // 1) Ставка + % вхід => ТОЛЬКО ВХОД (и только Джерельна)
+    if (payType === PAYTYPE_FOR_ENTRANCE) {
+      if (outletId !== entranceOutletId) continue;
 
-    if (outletId === entranceOutletId) {
       const ent = entranceByKey.has(key) ? entranceByKey.get(key) : 0;
-      fieldsToUpdate[FIELD_ENTRANCE_REVENUE] = ent;
+
+      updates.push({
+        id: r.id,
+        fields: { [FIELD_ENTRANCE_REVENUE]: ent },
+      });
+
       entranceWrites++;
+      continue;
     }
 
-    updates.push({ id: r.id, fields: fieldsToUpdate });
+    // 2) % или Ставка + % => ТОЛЬКО ОБЩАЯ ВЫРУЧКА
+    if (PAYTYPE_FOR_TOTAL.has(payType)) {
+      const total = totalByKey.get(key);
+      if (typeof total !== "number") continue;
+
+      updates.push({
+        id: r.id,
+        fields: { [FIELD_REVENUE]: total },
+      });
+
+      totalWrites++;
+      continue;
+    }
   }
 
   if (updates.length) {
     await updateInBatches(TABLE_SHIFTS, updates, 10);
   }
 
-  console.log(`[ENTRANCE] Airtable writes: ${entranceWrites}`);
-  return { updated: updates.length };
+  console.log(`[TOTAL] writes "${FIELD_REVENUE}": ${totalWrites}`);
+  console.log(
+    `[ENTRANCE] writes "${FIELD_ENTRANCE_REVENUE}": ${entranceWrites}`
+  );
+
+  return { updated: updates.length, totalWrites, entranceWrites };
 }
 
 // ================== UI ==================
@@ -804,7 +839,9 @@ bot.action("ADM_SEND_POSTER", async (ctx) => {
 
     await ctx.reply(
       `Еквайринг: створено ${acqRes.created}\n` +
-        `Нарахування: оновлено ${updRes.updated}`
+        `Нарахування: оновлено ${updRes.updated}\n` +
+        `— Виручка: ${updRes.totalWrites}\n` +
+        `— Виручка Вхід: ${updRes.entranceWrites}`
     );
 
     userState.delete(ctx.from.id);
