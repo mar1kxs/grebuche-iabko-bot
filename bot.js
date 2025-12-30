@@ -21,33 +21,47 @@ const TABLE_OUTLETS = "Заклади";
 const TABLE_POSITIONS = "Посади";
 const TABLE_EMPLOYEES = "Працівники";
 
+// linked tables primary-name fields
 const OUTLETS_NAME_FIELD = "Назва закладу";
 const POSITIONS_NAME_FIELD = "Скорочена назва";
+
+// employees
 const EMP_TG_FIELD = "Telegram ID";
 
+// shifts fields
 const FIELD_DATE = "Дата";
 const FIELD_OUTLET = "Заклад";
 const FIELD_POSITION = "Посада";
 const FIELD_EMPLOYEE = "Працівник";
 const FIELD_REVENUE = "Виручка";
+const FIELD_ENTRANCE_REVENUE = "Виручка Вхід";
 
-const EMP_PAYTYPE_FIELD = "ЗП для бота";
-const PAYTYPE_ALLOWED = new Set(["%", "Ставка + %"]);
+const SHIFT_PAYTYPE_FIELD = "ЗП для бота";
+const PAYTYPE_ALLOWED = new Set(["%", "Ставка + %"]); // НЕ ТРОГАЮ
 
+// acquiring field
 const FIELD_ACQ_VALUE = "Еквайринг Poster (API)";
 
+// Poster tokens
 const POSTER_TOKENS = {
   Староєврейська: process.env.POSTER_SE,
   Дорошенка: process.env.POSTER_DO,
   Джерельна: process.env.POSTER_DZH,
 };
 
+// Poster accounts
 const POSTER_ACCOUNTS = {
   Староєврейська: "grebu4e",
   Дорошенка: "grebuche-iabko-kriva-lipa",
   Джерельна: "rayon-gy",
 };
 
+// Entrance category (ONLY for Джерельна)
+const ENTRANCE_OUTLET_NAME = "Джерельна";
+const ENTRANCE_CATEGORY_NAME = "БРАСЛЕТИ - ВХОДИ";
+const ENTRANCE_CATEGORY_ID = "18";
+
+// ================== LISTS ==================
 const OUTLETS = ["Староєврейська", "Дорошенка", "Джерельна"];
 const POSITIONS = [
   "СТ Бармен",
@@ -147,6 +161,18 @@ function toISODateOnly(val) {
   return null;
 }
 
+function pickTextValue(v) {
+  if (typeof v === "string") return v.trim();
+  if (Array.isArray(v)) return String(v[0] || "").trim();
+  if (v && typeof v === "object" && v.name) return String(v.name).trim();
+  return "";
+}
+
+function normalizeMoneyToNumber(x) {
+  const n = Number(x);
+  return Number.isFinite(n) ? n : 0;
+}
+
 // ================== LINK RESOLVERS ==================
 const linkIdCache = new Map();
 
@@ -190,7 +216,9 @@ async function linkPosition(positionName) {
   return [id];
 }
 
+// ---- Employee by TG ID (linked) ----
 const employeeCache = new Map();
+
 async function getEmployeeRecIdByTgId(tgId) {
   const key = String(tgId);
   if (employeeCache.has(key)) return employeeCache.get(key);
@@ -243,16 +271,63 @@ async function posterGetPaymentsByDay({ account, token, startDate, endDate }) {
 
   return days.map((day) => ({
     date: day.date || null,
-    cardRevenue: Number(day.payed_card_sum || 0) / 100,
+    cardRevenue: normalizeMoneyToNumber(day.payed_card_sum || 0) / 100,
     totalRevenue:
-      Number(day.payed_sum_sum ?? day.total_sum ?? day.sum ?? 0) / 100,
+      normalizeMoneyToNumber(
+        day.payed_sum_sum ?? day.total_sum ?? day.sum ?? 0
+      ) / 100,
   }));
+}
+
+async function posterGetEntranceRevenueForOneDay({ account, token, dateISO }) {
+  const url = `https://${account}.joinposter.com/api/dash.getCategoriesSales`;
+
+  const { data } = await axios.get(url, {
+    params: { token, date_from: dateISO, date_to: dateISO },
+    timeout: 20000,
+  });
+
+  if (typeof data === "string") {
+    throw new Error(
+      `Poster returned non-JSON string for ${account} (categories)`
+    );
+  }
+  if (data?.error) {
+    throw new Error(
+      `Poster error for ${account} (categories): ${
+        data.error.message || "Unknown error"
+      }`
+    );
+  }
+
+  const rows = data?.response;
+  if (!Array.isArray(rows)) {
+    throw new Error(`Unexpected Poster categories format for ${account}`);
+  }
+
+  let revenue = 0;
+  for (const r of rows) {
+    const id = String(r.category_id || "").trim();
+    const name = String(r.category_name || "").trim();
+
+    const matchById =
+      ENTRANCE_CATEGORY_ID && id === String(ENTRANCE_CATEGORY_ID);
+    const matchByName =
+      ENTRANCE_CATEGORY_NAME && name === String(ENTRANCE_CATEGORY_NAME);
+
+    if (matchById || matchByName) {
+      revenue += normalizeMoneyToNumber(r.revenue || 0) / 100;
+    }
+  }
+
+  return revenue; // number
 }
 
 // ================== FETCH POSTER DATA (demo/real) ==================
 async function fetchPosterData(startDate, endDate) {
   const mode = (process.env.POSTER_MODE || "demo").toLowerCase();
 
+  // DEMO
   if (mode === "demo") {
     const days = datesBetween(startDate, endDate);
     const acquiring = [];
@@ -265,15 +340,25 @@ async function fetchPosterData(startDate, endDate) {
         const cardRevenue = round2(totalRevenue * (0.25 + rand() * 0.45));
 
         acquiring.push({ date: day, outlet, cardRevenue });
-        accruals.push({ date: day, outlet, totalRevenue });
+        const a = { date: day, outlet, totalRevenue };
+
+        // demo entrance only for Джерельна
+        if (outlet === ENTRANCE_OUTLET_NAME) {
+          a.entranceRevenue = round2(totalRevenue * 0.08);
+        }
+
+        accruals.push(a);
       }
     }
 
     return { acquiring, accruals };
   }
 
+  // REAL
   const acquiring = [];
   const accruals = [];
+
+  const daysList = datesBetween(startDate, endDate);
 
   for (const outlet of OUTLETS) {
     const token = POSTER_TOKENS[outlet];
@@ -289,11 +374,37 @@ async function fetchPosterData(startDate, endDate) {
       endDate,
     });
 
+    const paymentsByDate = new Map();
     for (const d of daysData) {
       if (!d.date) continue;
+      paymentsByDate.set(d.date, d);
+      acquiring.push({
+        date: d.date,
+        outlet,
+        cardRevenue: d.cardRevenue,
+      });
+    }
 
-      acquiring.push({ date: d.date, outlet, cardRevenue: d.cardRevenue });
-      accruals.push({ date: d.date, outlet, totalRevenue: d.totalRevenue });
+    for (const dayISO of daysList) {
+      const p = paymentsByDate.get(dayISO);
+      if (!p) continue;
+
+      const a = {
+        date: dayISO,
+        outlet,
+        totalRevenue: p.totalRevenue,
+      };
+
+      if (outlet === ENTRANCE_OUTLET_NAME) {
+        const entrance = await posterGetEntranceRevenueForOneDay({
+          account,
+          token,
+          dateISO: dayISO,
+        });
+        a.entranceRevenue = entrance;
+      }
+
+      accruals.push(a);
     }
   }
 
@@ -306,6 +417,7 @@ async function savePosterToAirtable(posterData) {
 
   for (const item of posterData.acquiring) {
     const outletLink = await linkOutlet(item.outlet);
+
     acquiringRecords.push({
       fields: {
         [FIELD_DATE]: item.date,
@@ -322,20 +434,24 @@ async function savePosterToAirtable(posterData) {
   return { created: acquiringRecords.length };
 }
 
-// ================== APPLY TOTAL REVENUE TO SHIFTS (UPDATE ONLY) ==================
-async function applyTotalRevenueToShifts(accruals, startDate, endDate) {
+// ================== APPLY REVENUE TO SHIFTS (UPDATE ONLY) ==================
+async function applyRevenuesToShifts(accruals, startDate, endDate) {
   if (!accruals || !accruals.length) {
-    console.log("ACCRUALS: empty");
     return { updated: 0 };
   }
 
-  const revenueByKey = new Map();
+  const totalByKey = new Map();
+  const entranceByKey = new Map();
+
   for (const a of accruals) {
     const d = toISODateOnly(a.date);
     if (!d) continue;
-    revenueByKey.set(`${d}::${a.outlet}`, Number(a.totalRevenue || 0));
+    const k = `${d}::${a.outlet}`;
+    totalByKey.set(k, normalizeMoneyToNumber(a.totalRevenue || 0));
+    if (a.outlet === ENTRANCE_OUTLET_NAME) {
+      entranceByKey.set(k, normalizeMoneyToNumber(a.entranceRevenue || 0));
+    }
   }
-  console.log("ACCRUALS keys:", revenueByKey.size);
 
   const formula =
     `AND(` +
@@ -346,13 +462,13 @@ async function applyTotalRevenueToShifts(accruals, startDate, endDate) {
   const shiftRecs = await base(TABLE_SHIFTS)
     .select({
       filterByFormula: formula,
-      fields: [FIELD_DATE, FIELD_OUTLET, FIELD_EMPLOYEE, EMP_PAYTYPE_FIELD],
+      fields: [FIELD_DATE, FIELD_OUTLET, SHIFT_PAYTYPE_FIELD],
     })
     .all();
 
-  console.log("SHIFT FOUND:", shiftRecs.length);
   if (!shiftRecs.length) return { updated: 0 };
 
+  // outletId -> outletName
   const outletIds = new Set();
   for (const r of shiftRecs) {
     const outletLinks = r.fields?.[FIELD_OUTLET];
@@ -367,55 +483,42 @@ async function applyTotalRevenueToShifts(accruals, startDate, endDate) {
     outletNameById.set(outletId, name);
   }
 
-  const payTypeStats = {};
-  let skippedPaytype = 0;
-  let skippedNoRevenue = 0;
-  let skippedNoOutlet = 0;
-
   const updates = [];
 
   for (const r of shiftRecs) {
     const date = toISODateOnly(r.fields?.[FIELD_DATE]);
     const outletLinks = r.fields?.[FIELD_OUTLET];
-
     if (!date) continue;
-    if (!Array.isArray(outletLinks) || !outletLinks[0]) {
-      skippedNoOutlet++;
-      continue;
-    }
+    if (!Array.isArray(outletLinks) || !outletLinks[0]) continue;
 
     const outletName = outletNameById.get(outletLinks[0]);
-    if (!outletName) {
-      skippedNoOutlet++;
-      continue;
-    }
+    if (!outletName) continue;
 
-    const payType = String(r.fields?.[EMP_PAYTYPE_FIELD] || "").trim();
-    const k = payType || "(empty)";
-    payTypeStats[k] = (payTypeStats[k] || 0) + 1;
+    const payType = pickTextValue(r.fields?.[SHIFT_PAYTYPE_FIELD]);
+    if (!PAYTYPE_ALLOWED.has(payType)) continue;
 
-    if (!PAYTYPE_ALLOWED.has(payType)) {
-      skippedPaytype++;
-      continue;
-    }
+    const key = `${date}::${outletName}`;
+    const totalRevenue = totalByKey.get(key);
 
-    const totalRevenue = revenueByKey.get(`${date}::${outletName}`);
-    if (typeof totalRevenue !== "number") {
-      skippedNoRevenue++;
-      continue;
+    if (typeof totalRevenue !== "number") continue;
+
+    const fieldsToUpdate = {
+      [FIELD_REVENUE]: totalRevenue,
+    };
+
+    // entrance only for Джерельна
+    if (outletName === ENTRANCE_OUTLET_NAME) {
+      const ent = entranceByKey.get(key);
+      if (typeof ent === "number") {
+        fieldsToUpdate[FIELD_ENTRANCE_REVENUE] = ent;
+      }
     }
 
     updates.push({
       id: r.id,
-      fields: { [FIELD_REVENUE]: totalRevenue },
+      fields: fieldsToUpdate,
     });
   }
-
-  console.log("PAYTYPE STATS:", payTypeStats);
-  console.log("UPDATES:", updates.length);
-  console.log("SKIP paytype:", skippedPaytype);
-  console.log("SKIP no revenue match:", skippedNoRevenue);
-  console.log("SKIP no outlet:", skippedNoOutlet);
 
   if (updates.length) {
     await updateInBatches(TABLE_SHIFTS, updates, 10);
@@ -452,6 +555,7 @@ bot.action("EMP_FILL_SHIFT", async (ctx) => {
 bot.on("text", async (ctx) => {
   const state = userState.get(ctx.from.id);
   if (!state) return;
+
   if (state.role === "employee") return handleEmployeeFlow(ctx, state);
   if (state.role === "admin") return handleAdminFlow(ctx, state);
 });
@@ -530,7 +634,7 @@ bot.action(/EMP_POS_(.+)/, async (ctx) => {
   } catch (e) {
     console.error(e);
     return ctx.reply(
-      "Помилка при збереженні. Перевір linked поля та Telegram ID у Працівники."
+      "Помилка при збереженні.\nПеревір:\n1) що ти є в таблиці 'Працівники' з правильним Telegram ID\n2) що 'Працівник/Заклад/Посада' — це linked поля\n3) назви полів збігаються 1-в-1."
     );
   }
 });
@@ -538,6 +642,7 @@ bot.action(/EMP_POS_(.+)/, async (ctx) => {
 bot.action(/EMP_DEL_(.+)/, async (ctx) => {
   await ctx.answerCbQuery();
   const recId = ctx.match[1];
+
   try {
     await base(TABLE_SHIFTS).destroy(recId);
     return ctx.reply("Запис видалений.");
@@ -551,6 +656,7 @@ bot.action(/EMP_DEL_(.+)/, async (ctx) => {
 bot.action("ADM_POSTER", async (ctx) => {
   await ctx.answerCbQuery();
   if (!isAdmin(ctx)) return ctx.reply("Ви не адміністратор.");
+
   userState.set(ctx.from.id, { role: "admin", step: "START_DATE_INPUT" });
   return ctx.reply("Введіть початкову дату періода (РРРР-ММ-ДД).");
 });
@@ -655,7 +761,8 @@ bot.action("ADM_SEND_POSTER", async (ctx) => {
     const posterData = await fetchPosterData(state.startDate, state.endDate);
 
     const acqRes = await savePosterToAirtable(posterData);
-    const res = await applyTotalRevenueToShifts(
+
+    const updRes = await applyRevenuesToShifts(
       posterData.accruals,
       state.startDate,
       state.endDate
@@ -663,7 +770,7 @@ bot.action("ADM_SEND_POSTER", async (ctx) => {
 
     await ctx.reply(
       `Еквайринг: створено ${acqRes.created}\n` +
-        `Виручка в змінах (Нарахування): оновлено ${res?.updated || 0}`
+        `Нарахування: оновлено ${updRes.updated}`
     );
 
     userState.delete(ctx.from.id);
