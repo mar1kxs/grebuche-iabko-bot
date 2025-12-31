@@ -21,6 +21,9 @@ const TABLE_OUTLETS = "Заклади";
 const TABLE_POSITIONS = "Посади";
 const TABLE_EMPLOYEES = "Працівники";
 
+const TABLE_DEDUCTIONS = "Відрахування";
+const FIELD_DEDUCTIONS_LINK = "Відрахування(Вибрати)";
+
 // linked tables primary-name fields
 const OUTLETS_NAME_FIELD = "Назва закладу";
 const POSITIONS_NAME_FIELD = "Скорочена назва";
@@ -63,7 +66,7 @@ const POSTER_ACCOUNTS = {
 // Entrance category (ONLY for Джерельна)
 const ENTRANCE_OUTLET_NAME = "Джерельна";
 const ENTRANCE_CATEGORY_NAME = "БРАСЛЕТИ - ВХОДИ";
-const ENTRANCE_CATEGORY_ID = "18"; // можно оставить, мы матчим id ИЛИ имя
+const ENTRANCE_CATEGORY_ID = "18";
 
 // ================== LISTS ==================
 const OUTLETS = ["Староєврейська", "Дорошенка", "Джерельна"];
@@ -321,7 +324,6 @@ async function posterGetEntranceRevenueForOneDay({ account, token, dateISO }) {
   const targetName = normText(ENTRANCE_CATEGORY_NAME);
 
   let revenue = 0;
-  let matched = 0;
 
   for (const r of rows) {
     const id = String(r.category_id ?? "").trim();
@@ -331,27 +333,11 @@ async function posterGetEntranceRevenueForOneDay({ account, token, dateISO }) {
     const matchByName = targetName && name === targetName;
 
     if (matchById || matchByName) {
-      matched++;
       revenue += normalizeMoneyToNumber(r.revenue || 0) / 100;
     }
   }
 
-  console.log(
-    `[ENTRANCE] ${account} ${dateISO} matched=${matched} revenue=${revenue}`
-  );
-
-  if (!matched) {
-    const sample = rows.slice(0, 10).map((x) => ({
-      id: x.category_id,
-      name: x.category_name,
-      revenue: x.revenue,
-    }));
-    console.log(
-      `[ENTRANCE] NO MATCH. targetId=${targetId} targetName="${ENTRANCE_CATEGORY_NAME}". sample:`,
-      sample
-    );
-  }
-
+  console.log(`[ENTRANCE] ${account} ${dateISO} revenue=${revenue}`);
   return revenue; // number
 }
 
@@ -359,7 +345,7 @@ async function posterGetEntranceRevenueForOneDay({ account, token, dateISO }) {
 async function fetchPosterData(startDate, endDate) {
   const mode = (process.env.POSTER_MODE || "demo").toLowerCase();
 
-  // ✅ outletName -> outletRecordId (в Airtable)
+  // outletName -> outletRecordId (Airtable)
   const outletIdByName = {};
   for (const outlet of OUTLETS) {
     const [id] = await linkOutlet(outlet);
@@ -469,7 +455,6 @@ async function savePosterToAirtable(posterData) {
   const acquiringRecords = [];
 
   for (const item of posterData.acquiring) {
-    // item.outletId уже есть, но linked поле ждёт массив [id]
     const outletLink = item.outletId
       ? [item.outletId]
       : await linkOutlet(item.outlet);
@@ -500,7 +485,8 @@ async function getEntranceOutletId() {
 }
 
 async function applyRevenuesToShifts(accruals, startDate, endDate) {
-  if (!accruals || !accruals.length) return { updated: 0 };
+  if (!accruals || !accruals.length)
+    return { updated: 0, totalWrites: 0, entranceWrites: 0 };
 
   const entranceOutletId = await getEntranceOutletId();
 
@@ -519,7 +505,6 @@ async function applyRevenuesToShifts(accruals, startDate, endDate) {
     totalByKey.set(k, normalizeMoneyToNumber(a.totalRevenue || 0));
 
     if (outletId === entranceOutletId) {
-      // кладём даже 0
       entranceByKey.set(k, normalizeMoneyToNumber(a.entranceRevenue || 0));
     }
   }
@@ -537,7 +522,8 @@ async function applyRevenuesToShifts(accruals, startDate, endDate) {
     })
     .all();
 
-  if (!shiftRecs.length) return { updated: 0 };
+  if (!shiftRecs.length)
+    return { updated: 0, totalWrites: 0, entranceWrites: 0 };
 
   const updates = [];
   let totalWrites = 0;
@@ -551,13 +537,10 @@ async function applyRevenuesToShifts(accruals, startDate, endDate) {
 
     const outletId = outletLinks[0];
     const payType = pickTextValue(r.fields?.[SHIFT_PAYTYPE_FIELD]);
-
     const key = `${date}::${outletId}`;
 
-    // 1) Ставка + % вхід => ТОЛЬКО ВХОД (и только Джерельна)
     if (payType === PAYTYPE_FOR_ENTRANCE) {
       if (outletId !== entranceOutletId) continue;
-
       const ent = entranceByKey.has(key) ? entranceByKey.get(key) : 0;
 
       updates.push({
@@ -569,7 +552,6 @@ async function applyRevenuesToShifts(accruals, startDate, endDate) {
       continue;
     }
 
-    // 2) % или Ставка + % => ТОЛЬКО ОБЩАЯ ВЫРУЧКА
     if (PAYTYPE_FOR_TOTAL.has(payType)) {
       const total = totalByKey.get(key);
       if (typeof total !== "number") continue;
@@ -596,6 +578,110 @@ async function applyRevenuesToShifts(accruals, startDate, endDate) {
   return { updated: updates.length, totalWrites, entranceWrites };
 }
 
+// ================== SYNC "Відрахування" -> "Нарахування" ==================
+let syncDeductionsLock = false;
+
+function normalizeAirtableDateToISO(value) {
+  if (!value) return null;
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return null;
+  return d.toISOString().slice(0, 10);
+}
+function makeDedKey(employeeId, outletId, dateISO) {
+  return `${employeeId}__${outletId}__${dateISO}`;
+}
+
+async function syncDeductionsToAccruals() {
+  const stats = {
+    deductionsTotal: 0,
+    deductionsSkipped: 0,
+    keys: 0,
+    accrualsTotal: 0,
+    accrualsSkipped: 0,
+    updatesPlanned: 0,
+    updated: 0,
+    batches: 0,
+  };
+
+  const deductionRecords = await base(TABLE_DEDUCTIONS)
+    .select({ fields: [FIELD_EMPLOYEE, FIELD_OUTLET, FIELD_DATE] })
+    .all();
+
+  stats.deductionsTotal = deductionRecords.length;
+
+  const map = new Map(); // key -> array of deduction IDs
+  for (const r of deductionRecords) {
+    const emp = r.get(FIELD_EMPLOYEE);
+    const outlet = r.get(FIELD_OUTLET);
+    const dateISO = normalizeAirtableDateToISO(r.get(FIELD_DATE));
+
+    if (!emp?.[0] || !outlet?.[0] || !dateISO) {
+      stats.deductionsSkipped++;
+      continue;
+    }
+
+    const key = makeDedKey(emp[0], outlet[0], dateISO);
+    if (!map.has(key)) map.set(key, []);
+    map.get(key).push(r.id);
+  }
+
+  stats.keys = map.size;
+
+  const accrualRecords = await base(TABLE_SHIFTS)
+    .select({
+      fields: [FIELD_EMPLOYEE, FIELD_OUTLET, FIELD_DATE, FIELD_DEDUCTIONS_LINK],
+    })
+    .all();
+
+  stats.accrualsTotal = accrualRecords.length;
+
+  const updates = [];
+
+  for (const r of accrualRecords) {
+    const emp = r.get(FIELD_EMPLOYEE);
+    const outlet = r.get(FIELD_OUTLET);
+    const dateISO = normalizeAirtableDateToISO(r.get(FIELD_DATE));
+
+    if (!emp?.[0] || !outlet?.[0] || !dateISO) {
+      stats.accrualsSkipped++;
+      continue;
+    }
+
+    const key = makeDedKey(emp[0], outlet[0], dateISO);
+    const needed = map.get(key);
+    if (!needed?.length) continue;
+
+    const existing = r.get(FIELD_DEDUCTIONS_LINK) || [];
+    const set = new Set(existing);
+
+    let changed = false;
+    for (const id of needed) {
+      if (!set.has(id)) {
+        set.add(id);
+        changed = true;
+      }
+    }
+
+    if (changed) {
+      updates.push({
+        id: r.id,
+        fields: { [FIELD_DEDUCTIONS_LINK]: Array.from(set) },
+      });
+    }
+  }
+
+  stats.updatesPlanned = updates.length;
+
+  while (updates.length) {
+    stats.batches++;
+    const batch = updates.splice(0, 10);
+    await base(TABLE_SHIFTS).update(batch);
+    stats.updated += batch.length;
+  }
+
+  return stats;
+}
+
 // ================== UI ==================
 function mainMenu(ctx) {
   const buttons = [];
@@ -604,6 +690,12 @@ function mainMenu(ctx) {
   if (isAdmin(ctx)) {
     buttons.push([
       Markup.button.callback("Передати інформацію з POSTER", "ADM_POSTER"),
+    ]);
+    buttons.push([
+      Markup.button.callback(
+        "🔁 Синхр. Відрахування → Нарахування",
+        "ADM_SYNC_DEDUCTIONS"
+      ),
     ]);
   }
 
@@ -849,6 +941,47 @@ bot.action("ADM_SEND_POSTER", async (ctx) => {
   } catch (e) {
     console.error(e);
     return ctx.reply(`Помилка імпорту: ${e.message || "unknown error"}`);
+  }
+});
+
+// ✅ ADMIN: SYNC DEDUCTIONS BUTTON
+bot.action("ADM_SYNC_DEDUCTIONS", async (ctx) => {
+  await ctx.answerCbQuery();
+  if (!isAdmin(ctx)) return ctx.reply("Ви не адміністратор.");
+
+  if (syncDeductionsLock) {
+    return ctx.reply(
+      "⏳ Синхронізація вже виконується. Спробуй трохи пізніше."
+    );
+  }
+
+  syncDeductionsLock = true;
+
+  try {
+    await ctx.reply(
+      "🔄 Запускаю синхронізацію «Відрахування → Нарахування»..."
+    );
+
+    const s = await syncDeductionsToAccruals();
+
+    await ctx.reply(
+      `✅ Готово!\n\n` +
+        `Відрахування: ${s.deductionsTotal}\n` +
+        `Пропущено (Відрахування): ${s.deductionsSkipped}\n` +
+        `Унікальних ключів: ${s.keys}\n\n` +
+        `Нарахування: ${s.accrualsTotal}\n` +
+        `Пропущено (Нарахування): ${s.accrualsSkipped}\n\n` +
+        `План оновлень: ${s.updatesPlanned}\n` +
+        `Оновлено: ${s.updated}\n` +
+        `Батчів: ${s.batches}`
+    );
+  } catch (e) {
+    console.error(e);
+    await ctx.reply(
+      `❌ Помилка синхронізації: ${e.message || "unknown error"}`
+    );
+  } finally {
+    syncDeductionsLock = false;
   }
 });
 
