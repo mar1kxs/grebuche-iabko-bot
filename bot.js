@@ -591,16 +591,27 @@ function makeDedKey(employeeId, outletId, dateISO) {
   return `${employeeId}__${outletId}__${dateISO}`;
 }
 
+function fmtUndedItem(x) {
+  const parts = [];
+  parts.push(`• ${x.id}`);
+  if (x.reason) parts.push(`— ${x.reason}`);
+  if (x.key) parts.push(`(key: ${x.key})`);
+  return parts.join(" ");
+}
+
 async function syncDeductionsToAccruals() {
   const stats = {
     deductionsTotal: 0,
-    deductionsSkipped: 0,
+    deductionsSkippedMissingFields: 0,
     keys: 0,
     accrualsTotal: 0,
-    accrualsSkipped: 0,
+    accrualsSkippedMissingFields: 0,
     updatesPlanned: 0,
     updated: 0,
     batches: 0,
+
+    deductionsNotAddedCount: 0,
+    deductionsNotAddedSample: [],
   };
 
   const deductionRecords = await base(TABLE_DEDUCTIONS)
@@ -609,18 +620,29 @@ async function syncDeductionsToAccruals() {
 
   stats.deductionsTotal = deductionRecords.length;
 
-  const map = new Map(); // key -> array of deduction IDs
+  const map = new Map();
+
+  const validDeductionIds = new Set();
+  const invalidDeductionIds = [];
+
   for (const r of deductionRecords) {
     const emp = r.get(FIELD_EMPLOYEE);
     const outlet = r.get(FIELD_OUTLET);
     const dateISO = normalizeAirtableDateToISO(r.get(FIELD_DATE));
 
     if (!emp?.[0] || !outlet?.[0] || !dateISO) {
-      stats.deductionsSkipped++;
+      stats.deductionsSkippedMissingFields++;
+      invalidDeductionIds.push({
+        id: r.id,
+        reason: "немає Працівник/Заклад/Дата",
+        key: "",
+      });
       continue;
     }
 
     const key = makeDedKey(emp[0], outlet[0], dateISO);
+    validDeductionIds.add(r.id);
+
     if (!map.has(key)) map.set(key, []);
     map.get(key).push(r.id);
   }
@@ -635,7 +657,9 @@ async function syncDeductionsToAccruals() {
 
   stats.accrualsTotal = accrualRecords.length;
 
-  const updates = [];
+  const accrualKeySet = new Set();
+
+  const alreadyLinkedDeductionIds = new Set();
 
   for (const r of accrualRecords) {
     const emp = r.get(FIELD_EMPLOYEE);
@@ -643,9 +667,25 @@ async function syncDeductionsToAccruals() {
     const dateISO = normalizeAirtableDateToISO(r.get(FIELD_DATE));
 
     if (!emp?.[0] || !outlet?.[0] || !dateISO) {
-      stats.accrualsSkipped++;
+      stats.accrualsSkippedMissingFields++;
       continue;
     }
+
+    const key = makeDedKey(emp[0], outlet[0], dateISO);
+    accrualKeySet.add(key);
+
+    const existing = r.get(FIELD_DEDUCTIONS_LINK) || [];
+    for (const id of existing) alreadyLinkedDeductionIds.add(id);
+  }
+
+  const updates = [];
+
+  for (const r of accrualRecords) {
+    const emp = r.get(FIELD_EMPLOYEE);
+    const outlet = r.get(FIELD_OUTLET);
+    const dateISO = normalizeAirtableDateToISO(r.get(FIELD_DATE));
+
+    if (!emp?.[0] || !outlet?.[0] || !dateISO) continue;
 
     const key = makeDedKey(emp[0], outlet[0], dateISO);
     const needed = map.get(key);
@@ -672,12 +712,50 @@ async function syncDeductionsToAccruals() {
 
   stats.updatesPlanned = updates.length;
 
+  const updatesCopyLen = updates.length;
   while (updates.length) {
     stats.batches++;
     const batch = updates.splice(0, 10);
     await base(TABLE_SHIFTS).update(batch);
     stats.updated += batch.length;
   }
+
+  const notAdded = [];
+
+  for (const x of invalidDeductionIds) notAdded.push(x);
+
+  for (const r of deductionRecords) {
+    const emp = r.get(FIELD_EMPLOYEE);
+    const outlet = r.get(FIELD_OUTLET);
+    const dateISO = normalizeAirtableDateToISO(r.get(FIELD_DATE));
+
+    if (!emp?.[0] || !outlet?.[0] || !dateISO) continue;
+
+    const key = makeDedKey(emp[0], outlet[0], dateISO);
+
+    if (!accrualKeySet.has(key)) {
+      notAdded.push({
+        id: r.id,
+        reason:
+          "немає відповідного запису у «Нарахування» (Працівник+Заклад+Дата)",
+        key,
+      });
+    }
+  }
+
+  const filteredNotAdded = notAdded.filter(
+    (x) => !alreadyLinkedDeductionIds.has(x.id)
+  );
+
+  stats.deductionsNotAddedCount = filteredNotAdded.length;
+
+  stats.deductionsNotAddedSample = filteredNotAdded
+    .slice(0, 20)
+    .map(fmtUndedItem);
+
+  console.log(
+    `[DEDUCTIONS] planned=${updatesCopyLen} updated=${stats.updated} notAdded=${stats.deductionsNotAddedCount}`
+  );
 
   return stats;
 }
@@ -964,17 +1042,25 @@ bot.action("ADM_SYNC_DEDUCTIONS", async (ctx) => {
 
     const s = await syncDeductionsToAccruals();
 
-    await ctx.reply(
+    let msg =
       `✅ Готово!\n\n` +
-        `Відрахування: ${s.deductionsTotal}\n` +
-        `Пропущено (Відрахування): ${s.deductionsSkipped}\n` +
-        `Унікальних ключів: ${s.keys}\n\n` +
-        `Нарахування: ${s.accrualsTotal}\n` +
-        `Пропущено (Нарахування): ${s.accrualsSkipped}\n\n` +
-        `План оновлень: ${s.updatesPlanned}\n` +
-        `Оновлено: ${s.updated}\n` +
-        `Батчів: ${s.batches}`
-    );
+      `Відрахування: ${s.deductionsTotal}\n` +
+      `Пропущено (немає Працівник/Заклад/Дата): ${s.deductionsSkippedMissingFields}\n` +
+      `Унікальних ключів: ${s.keys}\n\n` +
+      `Нарахування: ${s.accrualsTotal}\n` +
+      `Пропущено (немає Працівник/Заклад/Дата): ${s.accrualsSkippedMissingFields}\n\n` +
+      `План оновлень: ${s.updatesPlanned}\n` +
+      `Оновлено: ${s.updated}\n` +
+      `Батчів: ${s.batches}\n\n` +
+      `⚠️ Відрахування НЕ були додані: ${s.deductionsNotAddedCount}`;
+
+    if (s.deductionsNotAddedSample.length) {
+      msg +=
+        `\n\nПерші ${s.deductionsNotAddedSample.length}:\n` +
+        s.deductionsNotAddedSample.join("\n");
+    }
+
+    await ctx.reply(msg);
   } catch (e) {
     console.error(e);
     await ctx.reply(
