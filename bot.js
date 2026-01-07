@@ -1054,12 +1054,6 @@ bot.action("ADM_SYNC_DEDUCTIONS", async (ctx) => {
       `Батчів: ${s.batches}\n\n` +
       `⚠️ Відрахування НЕ були додані: ${s.deductionsNotAddedCount}`;
 
-    if (s.deductionsNotAddedSample.length) {
-      msg +=
-        `\n\nПерші ${s.deductionsNotAddedSample.length}:\n` +
-        s.deductionsNotAddedSample.join("\n");
-    }
-
     await ctx.reply(msg);
   } catch (e) {
     console.error(e);
