@@ -1165,7 +1165,7 @@ bot.action(/EMP_DEL_(.+)/, async (ctx) => {
 });
 
 // ================== EMPLOYEE: EDIT SHIFT ==================
-bot.action(/EMP_EDIT_(.+)/, async (ctx) => {
+bot.action(/^EMP_EDIT_(rec[a-zA-Z0-9]{14})$/, async (ctx) => {
   await ctx.answerCbQuery();
   const recId = ctx.match[1];
 
@@ -1392,8 +1392,6 @@ bot.action("EMP_REP_END_OK", async (ctx) => {
 
     const employeeRecId = await getEmployeeRecIdByTgId(ctx.from.id);
 
-    // Фильтруем в Airtable ТОЛЬКО по дате (это быстро),
-    // а по сотруднику отфильтруем уже в JS (это надежно).
     const formula =
       `AND(` +
       `DATETIME_FORMAT({${FIELD_DATE}}, "YYYY-MM-DD") >= "${escapeAirtableStr(startDate)}",` +
@@ -1407,7 +1405,6 @@ bot.action("EMP_REP_END_OK", async (ctx) => {
       })
       .all();
 
-    // JS-фильтр по linked recordId сотрудника
     const shiftRecs = allInRange.filter((r) => {
       const empLinks = r.fields?.[FIELD_EMPLOYEE];
       return Array.isArray(empLinks) && empLinks.includes(employeeRecId);
